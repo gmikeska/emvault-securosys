@@ -1,48 +1,57 @@
 //! [`SecurosysBackend`] — the [`HsmBackend`] implementation for Securosys
-//! Primus / `CloudHSM` over PKCS#11.
+//! Primus / `CloudHSM` over PKCS#11 (SLIP-10 HD derivation).
 //!
-//! ## Real SLIP-10 model (confirmed against the installed provider header + live HSM)
+//! ## Real SLIP-10 model (validated against the live SBX01 HSM)
 //!
-//! Constants below are the **real** Securosys values, read from
-//! `/usr/local/primus/include/pkcs11.h` and cross-checked against the live SBX01
-//! HSM (`pkcs11-tool --list-mechanisms` shows `mechtype-0x80000E01` with the
-//! derive flag). They are **not** placeholders anymore.
-//!
-//! Securosys does hierarchical-deterministic derivation like this:
-//! - **Master:** `C_GenerateKeyPair` with [`CKM_EC_SLIP10_KEY_PAIR_GEN`] (key type
-//!   [`CKK_EC_SLIP10`]), the BIP-39 seed passed as the mechanism parameter,
-//!   `CKA_DERIVE = true`. Produces an EC **key pair** (secp256k1 for Bitcoin).
+//! Securosys does HD derivation unlike `emvault-pkcs11`'s default (which assumes
+//! `C_DeriveKey` + per-level child index + attribute-readback). So this backend
+//! **overrides** the derivation methods with the real Securosys flow:
+//! - **Master:** `C_GenerateKeyPair` with [`CKM_EC_SLIP10_KEY_PAIR_GEN`], key type
+//!   [`CKK_EC_SLIP10`], the seed as the mechanism parameter, secp256k1 `CKA_EC_PARAMS`,
+//!   `CKA_DERIVE=true`. Persisted as a token object (so `load()` can find it).
 //! - **Child:** [`CKM_SLIP10_CHILD_DERIVE`] with `CK_SLIP10_CHILD_DERIVE_PARAMS`
-//!   = the **whole derivation path at once** (a vector of `CK_ULONG` levels,
-//!   hardened ≥ `0x80000000`). Securosys ships a `C_DeriveKeyPair` *vendor
-//!   extension* for this; the same mechanism is also usable with standard
-//!   `C_DeriveKey` (it carries the derive flag).
-//! - **Chain code:** read back via [`CKA_SLIP10_CHAIN_CODE`].
+//!   (the **whole path** as a `CK_ULONG` vector) via the vendor `C_DeriveKeyPair`
+//!   function. Children are session objects, marked both `CKA_DERIVE` + `CKA_SIGN`
+//!   so a returned handle can be an account-parent *or* a leaf-signer.
+//! - **XPUB metadata:** Securosys exposes only [`CKA_SLIP10_CHAIN_CODE`] + the EC
+//!   point (on the *public* key — the private key does **not** expose `CKA_EC_POINT`,
+//!   confirmed live: `C_GetAttributeValue` returns `CKR_ATTRIBUTE_TYPE_INVALID`).
+//!   So `read_xpub` reads the point off the paired public key (via a `priv→pub`
+//!   handle map populated at derive time, with a label fallback for the persisted
+//!   master) and builds a **normalized** xpub (depth/parent-fp/child = 0). That's
+//!   correct for emvault: the descriptor origin comes from the master fingerprint +
+//!   path, not the xpub's internal fields.
 //!
-//! ## ⚠️ Why the trait's default derive path does NOT work as-is for Securosys
-//!
-//! `emvault-pkcs11::HsmBackend` models derivation as: seed → **master via
-//! `C_DeriveKey`** (seed in `pParameter` + a base secret key), then children
-//! **one BIP-32 level per call** (single 4-byte child index), with the default
-//! [`HsmBackend::read_xpub`] reading vendor attributes for chain-code / depth /
-//! parent-fingerprint / child-index. That fits the dev shim, not Securosys:
-//!
-//! 1. Securosys master is `C_GenerateKeyPair` (a *pair*), not `C_DeriveKey` on a
-//!    secret. → `derive_master_key` must be **overridden**.
-//! 2. Securosys derives the **whole path in one call** (not per-level), via
-//!    `CK_SLIP10_CHILD_DERIVE_PARAMS`. → `derive_child_key` must be **overridden**.
-//! 3. Securosys exposes only `CKA_SLIP10_CHAIN_CODE`; depth / parent-fp /
-//!    child-index are not vendor attributes (compute host-side). → `read_xpub`
-//!    must be **overridden**.
-//!
-//! So the mechanism/attribute accessors below are pinned to the real values, but
-//! `SecurosysBackend` still needs the three overrides (Phase-1 follow-up; see the
-//! crate README / integration plan). Until then the default derive path will not
-//! produce correct results against Securosys — the accessors alone are not enough.
+//! Both create operations (`C_GenerateKeyPair`, the vendor `C_DeriveKeyPair`) use
+//! raw FFI — the vendor key type / mechanism params aren't expressible through
+//! `cryptoki`'s typed API. This mirrors the proven `examples/slip10_probe.rs`
+//! recipe exactly. Reads/finds use `cryptoki`'s safe `Session` API.
+
+// The only unsafe here is the isolated Securosys vendor-extension FFI below.
+#![allow(unsafe_code)]
+
+use std::collections::HashMap;
+use std::mem::size_of;
+use std::os::raw::c_void;
+use std::path::PathBuf;
+use std::ptr::addr_of_mut;
+use std::sync::{Mutex, OnceLock};
 
 use cryptoki::mechanism::MechanismType;
-use cryptoki::object::AttributeType;
-use emvault_pkcs11::HsmBackend;
+use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
+use cryptoki::session::Session;
+use cryptoki_sys::{
+    CK_ATTRIBUTE, CK_ATTRIBUTE_PTR, CK_ATTRIBUTE_TYPE, CK_BBOOL, CK_FALSE, CK_KEY_TYPE,
+    CK_MECHANISM, CK_MECHANISM_PTR, CK_OBJECT_CLASS, CK_OBJECT_HANDLE, CK_OBJECT_HANDLE_PTR, CK_RV,
+    CK_SESSION_HANDLE, CK_TRUE, CK_ULONG, CKA_CLASS, CKA_DERIVE, CKA_EC_PARAMS, CKA_EXTRACTABLE,
+    CKA_KEY_TYPE, CKA_LABEL, CKA_SENSITIVE, CKA_SIGN, CKA_TOKEN, CKA_VERIFY, CKO_PRIVATE_KEY,
+    CKO_PUBLIC_KEY, CKR_OK,
+};
+use emvault_pkcs11::bitcoin::NetworkKind;
+use emvault_pkcs11::bitcoin::bip32::{ChainCode, ChildNumber, DerivationPath, Fingerprint, Xpub};
+use emvault_pkcs11::bitcoin::hashes::{Hash, hash160};
+use emvault_pkcs11::bitcoin::secp256k1::PublicKey;
+use emvault_pkcs11::{HsmBackend, HsmBackendError, MasterKeyHandle};
 
 // --- Real Securosys constants (from /usr/local/primus/include/pkcs11.h) ---
 /// `CKM_EC_SLIP10_KEY_PAIR_GEN` — master keypair generation (seed as mech param).
@@ -50,64 +59,450 @@ pub const CKM_EC_SLIP10_KEY_PAIR_GEN: u64 = 0x8000_0E02;
 /// `CKM_SLIP10_CHILD_DERIVE` — child derivation (whole-path params).
 pub const CKM_SLIP10_CHILD_DERIVE: u64 = 0x8000_0E01;
 /// `CKK_EC_SLIP10` — key type for SLIP-10 EC keys (secp256k1 / secp256r1).
-/// Consumed by the forthcoming `derive_master_key` override (the master-keypair
-/// template sets this key type); referenced in tests until then.
-#[allow(dead_code)]
 pub const CKK_EC_SLIP10: u64 = 0x8000_0014;
 /// `CKA_SLIP10_CHAIN_CODE` — vendor attribute carrying the 32-byte chain code.
 pub const CKA_SLIP10_CHAIN_CODE: u64 = 0x8000_1100;
+/// secp256k1 curve OID (DER: 1.3.132.0.10).
+const SECP256K1_OID: [u8; 7] = [0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x0A];
+
+/// `CK_SLIP10_CHILD_DERIVE_PARAMS` (matches the vendor header layout).
+#[repr(C)]
+struct CkSlip10ChildDeriveParams {
+    pul_path_indexes: *mut CK_ULONG,
+    ul_index_count: CK_ULONG,
+}
+
+/// Standard `C_GenerateKeyPair` (used for the SLIP-10 master keypair).
+type CGenerateKeyPairFn = unsafe extern "C" fn(
+    CK_SESSION_HANDLE,
+    CK_MECHANISM_PTR,
+    CK_ATTRIBUTE_PTR,
+    CK_ULONG,
+    CK_ATTRIBUTE_PTR,
+    CK_ULONG,
+    CK_OBJECT_HANDLE_PTR,
+    CK_OBJECT_HANDLE_PTR,
+) -> CK_RV;
+
+/// The vendor-extension `C_DeriveKeyPair` (whole-path SLIP-10 child derive).
+type CDeriveKeyPairFn = unsafe extern "C" fn(
+    CK_SESSION_HANDLE,
+    CK_MECHANISM_PTR,
+    CK_OBJECT_HANDLE, // base (parent) private key
+    CK_ATTRIBUTE_PTR,
+    CK_ULONG,
+    CK_ATTRIBUTE_PTR,
+    CK_ULONG,
+    CK_OBJECT_HANDLE_PTR,
+    CK_OBJECT_HANDLE_PTR,
+) -> CK_RV;
+
+/// The two vendor entry points, plus the library that owns them (kept loaded).
+/// Function pointers are `Send + Sync`, so the whole struct is thread-safe.
+struct Ffi {
+    _lib: libloading::Library,
+    generate_key_pair: CGenerateKeyPairFn,
+    derive_key_pair: CDeriveKeyPairFn,
+}
 
 /// `HsmBackend` for Securosys Primus / `CloudHSM`.
-///
-/// Session open / login / key lookup / **ECDSA signing** / close inherit the
-/// vendor-neutral defaults from [`HsmBackend`] and work as-is. The **derivation**
-/// methods (`derive_master_key` / `derive_child_key` / `read_xpub`) still need
-/// Securosys-native overrides — see the module docs' SLIP-10 model + mismatch
-/// notes. The accessors here return the real Securosys mechanism/attribute IDs.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SecurosysBackend;
+pub struct SecurosysBackend {
+    lib_path: PathBuf,
+    ffi: OnceLock<Ffi>,
+    /// derived/generated private-key handle → its paired public-key handle,
+    /// so `read_xpub` can read the EC point (which lives on the public key).
+    pub_of: Mutex<HashMap<CK_OBJECT_HANDLE, CK_OBJECT_HANDLE>>,
+}
+
+impl std::fmt::Debug for SecurosysBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecurosysBackend")
+            .field("lib_path", &self.lib_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SecurosysBackend {
+    /// Create a backend that loads the vendor entry points from `lib_path` on
+    /// first use.
+    #[must_use]
+    pub fn new(lib_path: impl Into<PathBuf>) -> Self {
+        Self {
+            lib_path: lib_path.into(),
+            ffi: OnceLock::new(),
+            pub_of: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn ffi(&self) -> Result<&Ffi, HsmBackendError> {
+        if let Some(f) = self.ffi.get() {
+            return Ok(f);
+        }
+        let lib = unsafe { libloading::Library::new(&self.lib_path) }
+            .map_err(|e| HsmBackendError::Derivation(format!("dlopen Securosys lib: {e}")))?;
+        let generate_key_pair: CGenerateKeyPairFn = {
+            let sym: libloading::Symbol<'_, CGenerateKeyPairFn> = unsafe {
+                lib.get(b"C_GenerateKeyPair")
+            }
+            .map_err(|e| HsmBackendError::Derivation(format!("dlsym C_GenerateKeyPair: {e}")))?;
+            *sym
+        };
+        let derive_key_pair: CDeriveKeyPairFn = {
+            let sym: libloading::Symbol<'_, CDeriveKeyPairFn> = unsafe {
+                lib.get(b"C_DeriveKeyPair")
+            }
+            .map_err(|e| HsmBackendError::Derivation(format!("dlsym C_DeriveKeyPair: {e}")))?;
+            *sym
+        };
+        Ok(self.ffi.get_or_init(|| Ffi {
+            _lib: lib,
+            generate_key_pair,
+            derive_key_pair,
+        }))
+    }
+
+    fn record_pair(&self, priv_h: CK_OBJECT_HANDLE, pub_h: CK_OBJECT_HANDLE) {
+        if let Ok(mut m) = self.pub_of.lock() {
+            m.insert(priv_h, pub_h);
+        }
+    }
+
+    /// Read the EC point (from the paired public key) + chain code (from the
+    /// private key) and assemble a normalized account xpub.
+    fn build_xpub(
+        session: &Session,
+        priv_h: ObjectHandle,
+        pub_h: ObjectHandle,
+    ) -> Result<Xpub, HsmBackendError> {
+        let ec_point = get_ec_point(session, pub_h)?;
+        let chain_code = get_vendor(session, priv_h, CKA_SLIP10_CHAIN_CODE)?;
+        let public_key = parse_ec_point(&ec_point)?;
+        let chain_code: [u8; 32] = chain_code
+            .as_slice()
+            .try_into()
+            .map_err(|_| HsmBackendError::MetadataError("chain code != 32 bytes".into()))?;
+        Ok(Xpub {
+            network: NetworkKind::Main,
+            depth: 0,
+            parent_fingerprint: Fingerprint::from([0u8; 4]),
+            child_number: ChildNumber::Normal { index: 0 },
+            public_key,
+            chain_code: ChainCode::from(chain_code),
+        })
+    }
+
+    /// Resolve the public-key handle paired with a private-key handle: the
+    /// in-process map first, then (for a persisted master reloaded in a fresh
+    /// process) a `CKA_LABEL`-based lookup of the `"<label>::pub"` sibling.
+    fn pub_handle_for(
+        &self,
+        session: &Session,
+        priv_h: ObjectHandle,
+    ) -> Result<ObjectHandle, HsmBackendError> {
+        if let Ok(m) = self.pub_of.lock()
+            && let Some(&p) = m.get(&priv_h.handle())
+        {
+            return Ok(unsafe { ObjectHandle::new_from_raw(p) });
+        }
+        // Fallback: persisted master reloaded by label.
+        let label = read_label(session, priv_h)?;
+        let pub_label = pub_sibling_label(&label);
+        let found = session.find_objects(&[
+            Attribute::Class(ObjectClass::PUBLIC_KEY),
+            Attribute::Label(pub_label.into_bytes()),
+        ])?;
+        found
+            .into_iter()
+            .next()
+            .ok_or_else(|| HsmBackendError::MetadataError("no paired public key found".into()))
+    }
+}
 
 impl HsmBackend for SecurosysBackend {
+    // Required accessors: real Securosys IDs (the derive methods are overridden
+    // below, so the default derive path never consults these — kept for the trait).
     fn master_derive_mechanism(&self) -> MechanismType {
-        // Real: CKM_EC_SLIP10_KEY_PAIR_GEN. Note Securosys uses this with
-        // C_GenerateKeyPair, so the trait's default (C_DeriveKey) needs override.
-        MechanismType::new_vendor_defined(CKM_EC_SLIP10_KEY_PAIR_GEN)
-            .expect("CKM_EC_SLIP10_KEY_PAIR_GEN is in the vendor-defined range")
+        MechanismType::new_vendor_defined(CKM_EC_SLIP10_KEY_PAIR_GEN).expect("vendor-defined range")
     }
-
     fn child_derive_mechanism(&self) -> MechanismType {
-        // Real: CKM_SLIP10_CHILD_DERIVE (whole-path params, not per-level index).
-        MechanismType::new_vendor_defined(CKM_SLIP10_CHILD_DERIVE)
-            .expect("CKM_SLIP10_CHILD_DERIVE is in the vendor-defined range")
+        MechanismType::new_vendor_defined(CKM_SLIP10_CHILD_DERIVE).expect("vendor-defined range")
     }
-
     fn chain_code_attribute(&self) -> AttributeType {
-        // Real: CKA_SLIP10_CHAIN_CODE.
         AttributeType::VendorDefined(CKA_SLIP10_CHAIN_CODE)
     }
-
-    // --- Securosys does NOT expose these as vendor attributes; the read_xpub
-    // --- override computes them host-side. Values here are inert (unused once
-    // --- read_xpub is overridden) and must not be trusted as real Securosys IDs.
     fn depth_attribute(&self) -> AttributeType {
-        // TODO(securosys, phase 1): not exposed by Securosys — remove once
-        // read_xpub is overridden. Kept only to satisfy the trait.
         AttributeType::VendorDefined(0x8000_5F02)
     }
-
     fn parent_fingerprint_attribute(&self) -> AttributeType {
-        // TODO(securosys, phase 1): not exposed by Securosys (compute host-side).
         AttributeType::VendorDefined(0x8000_5F03)
     }
-
     fn child_index_attribute(&self) -> AttributeType {
-        // TODO(securosys, phase 1): not exposed by Securosys (compute host-side).
         AttributeType::VendorDefined(0x8000_5F04)
     }
-
     fn backend_name(&self) -> &'static str {
         "securosys"
     }
+
+    /// SLIP-10 master keygen from `seed` (128–512 bits), persisted as a token.
+    fn derive_master_key(
+        &self,
+        session: &Session,
+        seed: &[u8],
+        label: &str,
+    ) -> Result<MasterKeyHandle, HsmBackendError> {
+        if seed.is_empty() {
+            return Err(HsmBackendError::Derivation(
+                "Securosys SLIP-10 master gen needs a non-empty seed".into(),
+            ));
+        }
+        let mut mech = CK_MECHANISM {
+            mechanism: CKM_EC_SLIP10_KEY_PAIR_GEN,
+            pParameter: seed.as_ptr() as *mut c_void,
+            ulParameterLen: seed.len() as CK_ULONG,
+        };
+
+        let mut cls_pub: CK_OBJECT_CLASS = CKO_PUBLIC_KEY;
+        let mut cls_priv: CK_OBJECT_CLASS = CKO_PRIVATE_KEY;
+        let mut kt: CK_KEY_TYPE = CKK_EC_SLIP10;
+        let mut oid = SECP256K1_OID;
+        let (mut t, mut f): (CK_BBOOL, CK_BBOOL) = (CK_TRUE, CK_FALSE);
+        let mut priv_label = label.as_bytes().to_vec();
+        // Persist the paired public key under emvault's `/pub` sibling label
+        // (the private key arrives as `emvault/v1/<name>/priv`), so a fresh
+        // process can re-find it in `read_xpub` after `load()`.
+        let mut pub_label = pub_sibling_label(label).into_bytes();
+
+        let mut pub_tmpl = [
+            attr(
+                CKA_CLASS,
+                addr_of_mut!(cls_pub).cast(),
+                size_of::<CK_OBJECT_CLASS>(),
+            ),
+            attr(
+                CKA_KEY_TYPE,
+                addr_of_mut!(kt).cast(),
+                size_of::<CK_KEY_TYPE>(),
+            ),
+            attr(CKA_TOKEN, addr_of_mut!(t).cast(), 1),
+            attr(CKA_DERIVE, addr_of_mut!(t).cast(), 1),
+            attr(CKA_VERIFY, addr_of_mut!(t).cast(), 1),
+            attr(CKA_EC_PARAMS, oid.as_mut_ptr().cast(), oid.len()),
+            attr(CKA_LABEL, pub_label.as_mut_ptr().cast(), pub_label.len()),
+        ];
+        let mut priv_tmpl = [
+            attr(
+                CKA_CLASS,
+                addr_of_mut!(cls_priv).cast(),
+                size_of::<CK_OBJECT_CLASS>(),
+            ),
+            attr(
+                CKA_KEY_TYPE,
+                addr_of_mut!(kt).cast(),
+                size_of::<CK_KEY_TYPE>(),
+            ),
+            attr(CKA_TOKEN, addr_of_mut!(t).cast(), 1),
+            attr(CKA_DERIVE, addr_of_mut!(t).cast(), 1),
+            attr(CKA_SIGN, addr_of_mut!(t).cast(), 1),
+            attr(CKA_SENSITIVE, addr_of_mut!(t).cast(), 1),
+            attr(CKA_EXTRACTABLE, addr_of_mut!(f).cast(), 1),
+            attr(CKA_LABEL, priv_label.as_mut_ptr().cast(), priv_label.len()),
+        ];
+
+        let ffi = self.ffi()?;
+        let (mut m_pub, mut m_priv): (CK_OBJECT_HANDLE, CK_OBJECT_HANDLE) = (0, 0);
+        let rv = unsafe {
+            (ffi.generate_key_pair)(
+                session.handle(),
+                addr_of_mut!(mech),
+                pub_tmpl.as_mut_ptr(),
+                pub_tmpl.len() as CK_ULONG,
+                priv_tmpl.as_mut_ptr(),
+                priv_tmpl.len() as CK_ULONG,
+                addr_of_mut!(m_pub),
+                addr_of_mut!(m_priv),
+            )
+        };
+        // Keep the attribute backing stores alive across the FFI call.
+        drop((cls_pub, cls_priv, kt, oid, t, f, priv_label, pub_label));
+        if rv != CKR_OK {
+            return Err(HsmBackendError::Derivation(format!(
+                "C_GenerateKeyPair failed: rv=0x{rv:x}"
+            )));
+        }
+
+        let priv_h = unsafe { ObjectHandle::new_from_raw(m_priv) };
+        let pub_h = unsafe { ObjectHandle::new_from_raw(m_pub) };
+        self.record_pair(m_priv, m_pub);
+        let xpub = Self::build_xpub(session, priv_h, pub_h)?;
+        let fingerprint = fingerprint_of(&xpub.public_key);
+        Ok(MasterKeyHandle {
+            key_handle: priv_h,
+            xpub,
+            fingerprint,
+        })
+    }
+
+    /// Derive the whole `path` from `parent_handle` in one `C_DeriveKeyPair` call.
+    fn derive_path(
+        &self,
+        session: &Session,
+        parent_handle: ObjectHandle,
+        path: &DerivationPath,
+    ) -> Result<ObjectHandle, HsmBackendError> {
+        if path.as_ref().is_empty() {
+            return Ok(parent_handle);
+        }
+        let mut indexes: Vec<CK_ULONG> = path
+            .into_iter()
+            .map(|c| CK_ULONG::from(u32::from(*c)))
+            .collect();
+        let mut params = CkSlip10ChildDeriveParams {
+            pul_path_indexes: indexes.as_mut_ptr(),
+            ul_index_count: indexes.len() as CK_ULONG,
+        };
+        let mut mech = CK_MECHANISM {
+            mechanism: CKM_SLIP10_CHILD_DERIVE,
+            pParameter: addr_of_mut!(params).cast::<c_void>(),
+            ulParameterLen: size_of::<CkSlip10ChildDeriveParams>() as CK_ULONG,
+        };
+
+        // Child templates: session objects, usable as both parent and signer.
+        let (mut t, mut f): (CK_BBOOL, CK_BBOOL) = (CK_TRUE, CK_FALSE);
+        let mut pub_tmpl = [
+            attr(CKA_TOKEN, addr_of_mut!(f).cast(), 1),
+            attr(CKA_DERIVE, addr_of_mut!(t).cast(), 1),
+            attr(CKA_VERIFY, addr_of_mut!(t).cast(), 1),
+        ];
+        let mut priv_tmpl = [
+            attr(CKA_TOKEN, addr_of_mut!(f).cast(), 1),
+            attr(CKA_DERIVE, addr_of_mut!(t).cast(), 1),
+            attr(CKA_SIGN, addr_of_mut!(t).cast(), 1),
+            attr(CKA_SENSITIVE, addr_of_mut!(t).cast(), 1),
+            attr(CKA_EXTRACTABLE, addr_of_mut!(f).cast(), 1),
+        ];
+
+        let ffi = self.ffi()?;
+        let (mut child_pub, mut child_priv): (CK_OBJECT_HANDLE, CK_OBJECT_HANDLE) = (0, 0);
+        let rv = unsafe {
+            (ffi.derive_key_pair)(
+                session.handle(),
+                addr_of_mut!(mech),
+                parent_handle.handle(),
+                pub_tmpl.as_mut_ptr(),
+                pub_tmpl.len() as CK_ULONG,
+                priv_tmpl.as_mut_ptr(),
+                priv_tmpl.len() as CK_ULONG,
+                addr_of_mut!(child_pub),
+                addr_of_mut!(child_priv),
+            )
+        };
+        // Keep the path buffer + bool backing alive across the FFI call.
+        drop((indexes, t, f));
+        if rv != CKR_OK {
+            return Err(HsmBackendError::Derivation(format!(
+                "C_DeriveKeyPair failed: rv=0x{rv:x}"
+            )));
+        }
+        self.record_pair(child_priv, child_pub);
+        Ok(unsafe { ObjectHandle::new_from_raw(child_priv) })
+    }
+
+    fn read_xpub(
+        &self,
+        session: &Session,
+        key_handle: ObjectHandle,
+    ) -> Result<Xpub, HsmBackendError> {
+        let pub_h = self.pub_handle_for(session, key_handle)?;
+        Self::build_xpub(session, key_handle, pub_h)
+    }
+
+    fn master_fingerprint(
+        &self,
+        session: &Session,
+        key_handle: ObjectHandle,
+    ) -> Result<Fingerprint, HsmBackendError> {
+        let xpub = self.read_xpub(session, key_handle)?;
+        Ok(fingerprint_of(&xpub.public_key))
+    }
+}
+
+// --- helpers ---
+
+/// Map a private-key label (`emvault/v1/<name>/priv`) to its public sibling
+/// (`.../pub`), matching `emvault_pkcs11::key_ops::pub_label`. Falls back to
+/// appending `/pub` if the expected `/priv` suffix is absent.
+fn pub_sibling_label(priv_label: &str) -> String {
+    priv_label
+        .strip_suffix("/priv")
+        .map_or_else(|| format!("{priv_label}/pub"), |base| format!("{base}/pub"))
+}
+
+fn attr(t: CK_ATTRIBUTE_TYPE, p: *mut c_void, len: usize) -> CK_ATTRIBUTE {
+    CK_ATTRIBUTE {
+        type_: t,
+        pValue: p,
+        ulValueLen: len as CK_ULONG,
+    }
+}
+
+fn get_ec_point(session: &Session, h: ObjectHandle) -> Result<Vec<u8>, HsmBackendError> {
+    session
+        .get_attributes(h, &[AttributeType::EcPoint])?
+        .into_iter()
+        .find_map(|a| match a {
+            Attribute::EcPoint(v) => Some(v),
+            _ => None,
+        })
+        .ok_or_else(|| HsmBackendError::MetadataError("missing CKA_EC_POINT".into()))
+}
+
+fn get_vendor(session: &Session, h: ObjectHandle, t: u64) -> Result<Vec<u8>, HsmBackendError> {
+    session
+        .get_attributes(h, &[AttributeType::VendorDefined(t)])?
+        .into_iter()
+        .find_map(|a| match a {
+            Attribute::VendorDefined((ty, v)) if ty == AttributeType::VendorDefined(t) => Some(v),
+            _ => None,
+        })
+        .ok_or_else(|| HsmBackendError::MetadataError(format!("missing vendor attr 0x{t:x}")))
+}
+
+fn read_label(session: &Session, h: ObjectHandle) -> Result<String, HsmBackendError> {
+    let v = session
+        .get_attributes(h, &[AttributeType::Label])?
+        .into_iter()
+        .find_map(|a| match a {
+            Attribute::Label(v) => Some(v),
+            _ => None,
+        })
+        .ok_or_else(|| HsmBackendError::MetadataError("missing CKA_LABEL".into()))?;
+    Ok(String::from_utf8_lossy(&v).into_owned())
+}
+
+/// Unwrap a DER OCTET STRING (`CKA_EC_POINT`) to the SEC point, then parse.
+fn parse_ec_point(der: &[u8]) -> Result<PublicKey, HsmBackendError> {
+    let inner = if der.first() == Some(&0x04) && der.len() >= 2 {
+        let len_byte = der[1] as usize;
+        if len_byte < 0x80 {
+            &der[2..]
+        } else {
+            // long form: low 7 bits = number of length octets
+            let n = len_byte & 0x7f;
+            der.get(2 + n..).unwrap_or(&[])
+        }
+    } else {
+        der
+    };
+    PublicKey::from_slice(inner)
+        .map_err(|e| HsmBackendError::MetadataError(format!("invalid secp256k1 point: {e}")))
+}
+
+fn fingerprint_of(pk: &PublicKey) -> Fingerprint {
+    let h = hash160::Hash::hash(&pk.serialize());
+    let bytes = h.to_byte_array();
+    let mut fp = [0u8; 4];
+    fp.copy_from_slice(&bytes[..4]);
+    Fingerprint::from(fp)
 }
 
 #[cfg(test)]
@@ -115,19 +510,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn name_is_securosys() {
-        assert_eq!(SecurosysBackend.backend_name(), "securosys");
-    }
-
-    #[test]
-    fn real_slip10_constants_match_the_vendor_header() {
-        // Guards the values read from /usr/local/primus/include/pkcs11.h.
+    fn name_and_constants() {
+        let b = SecurosysBackend::new("/usr/lib/libprimusP11.so");
+        assert_eq!(b.backend_name(), "securosys");
         assert_eq!(CKM_EC_SLIP10_KEY_PAIR_GEN, 0x8000_0E02);
         assert_eq!(CKM_SLIP10_CHILD_DERIVE, 0x8000_0E01);
         assert_eq!(CKK_EC_SLIP10, 0x8000_0014);
         assert_eq!(CKA_SLIP10_CHAIN_CODE, 0x8000_1100);
-        // And they're all in the vendor-defined range.
-        assert!(MechanismType::new_vendor_defined(CKM_EC_SLIP10_KEY_PAIR_GEN).is_ok());
-        assert!(MechanismType::new_vendor_defined(CKM_SLIP10_CHILD_DERIVE).is_ok());
     }
 }

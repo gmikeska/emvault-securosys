@@ -23,6 +23,10 @@ emvault-pkcs11 = { version = "0.7.0", path = "../emvault-pkcs11" }
 emvault-core = { version = "0.7.0", path = "../emvault-core" }
 bitcoin = "0.32.10"
 cryptoki = "0.12"
+# Raw PKCS#11 types + the loader for the one Securosys vendor-extension call
+# (`C_DeriveKeyPair`) that cryptoki's typed API can't express.
+cryptoki-sys = "0.3"
+libloading = "0.8"
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -41,6 +45,12 @@ env_logger = "0.11"
 cryptoki-sys = "0.3"
 libloading = "0.8"
 hex = "0.4"
+# Live-HSM e2e: drive the overrides through the real Pkcs11Signer + BDK signer path.
+bdk_wallet = "3.1.0"
+serial_test = "3.5.0"
+# Mixed-vendor fleet e2e: a dev SoftHSM cosigner alongside a Securosys one.
+emvault-dev-signer = { version = "0.7.0", path = "../emvault-dev-signer" }
+dotenvy = "0.15"
 
 [[example]]
 name = "slip10_probe"

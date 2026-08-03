@@ -14,3 +14,4 @@ Cargo.lock
 .env.*
 *.secrets.cfg
 primus.cfg
+!.env.example

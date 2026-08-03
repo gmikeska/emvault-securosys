@@ -232,6 +232,15 @@ fn run() -> Result<(), String> {
         println!("master keypair: pub={m_pub} priv={m_priv}");
         let mcc = read_var(fl, session, m_priv, CKA_SLIP10_CHAIN_CODE)?;
         println!("master chain code: {}", hex::encode(&mcc));
+        // DIAGNOSTIC: can we read CKA_EC_POINT straight off the PRIVATE key?
+        match read_var(fl, session, m_priv, CKA_EC_POINT) {
+            Ok(p) => println!(
+                "DIAG: CKA_EC_POINT on PRIV master = {} ({} bytes)",
+                hex::encode(&p),
+                p.len()
+            ),
+            Err(e) => println!("DIAG: CKA_EC_POINT on PRIV master NOT available: {e}"),
+        }
 
         // ---- Whole-path child derive: m/44'/0'/0'/0/1 ----
         let path: [CK_ULONG; 5] = [0x8000_002C, 0x8000_0000, 0x8000_0000, 0, 1];

@@ -31,7 +31,10 @@
 //! confirmation against the installed `libprimusP11` and the Securosys docs —
 //! see that type's docs for the derivation seam.
 
-#![forbid(unsafe_code)]
+// This crate is safe except for the Securosys SLIP-10 vendor-extension FFI in
+// `pkcs11::backend` (`C_GenerateKeyPair` / `C_DeriveKeyPair`), which is isolated
+// and locally `#![allow(unsafe_code)]`. Everywhere else, unsafe is denied.
+#![deny(unsafe_code)]
 
 pub mod config;
 pub mod error;

@@ -4,4 +4,4 @@ mod backend;
 mod connect;
 
 pub use backend::SecurosysBackend;
-pub use connect::pkcs11_config;
+pub use connect::{pkcs11_config, securosys_registrar};
