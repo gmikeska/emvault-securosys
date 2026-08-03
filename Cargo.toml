@@ -1,0 +1,38 @@
+[package]
+name = "emvault-securosys"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gmikeska/emvault-securosys"
+description = "Securosys CloudHSM connector for emvault: PKCS#11 (Primus) transport for ECDSA/BIP-32 today, TSB REST (BIP-340/Taproot) transport later."
+
+[lib]
+name = "emvault_securosys"
+path = "src/lib.rs"
+
+[features]
+default = ["pkcs11"]
+# Native PKCS#11 (Primus P11 provider) transport — ECDSA + BIP-32/SLIP-10.
+pkcs11 = []
+# Transaction Security Broker REST transport — Schnorr/BIP-340 for Taproot (Phase 3).
+tsb = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
+taproot = ["tsb"]
+
+[dependencies]
+emvault-pkcs11 = { version = "0.7.0", path = "../emvault-pkcs11" }
+emvault-core = { version = "0.7.0", path = "../emvault-core" }
+bitcoin = "0.32.10"
+cryptoki = "0.12"
+secrecy = "0.10.3"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+dotenvy = "0.15"
+log = "0.4"
+
+# Optional — only compiled for the `tsb` feature (Phase 3, Taproot).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+tokio = { version = "1", features = ["rt", "macros"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+env_logger = "0.11"

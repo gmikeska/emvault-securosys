@@ -1,0 +1,16 @@
+/target
+Cargo.lock
+
+# Never commit the vendor PKCS#11 provider or its packages — it is Securosys
+# proprietary (EULA), a *runtime* dependency the operator installs themselves.
+*.so
+*.so.*
+*.deb
+*.rpm
+*.msi
+
+# Deployment-specific secrets / provider config — never distribute.
+.env
+.env.*
+*.secrets.cfg
+primus.cfg
