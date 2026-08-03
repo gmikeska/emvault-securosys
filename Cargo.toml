@@ -36,3 +36,12 @@ serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"
+# Raw PKCS#11 FFI for the SLIP-10 live-HSM probe (vendor key types / attributes /
+# the C_DeriveKeyPair vendor extension aren't expressible via cryptoki's typed API).
+cryptoki-sys = "0.3"
+libloading = "0.8"
+hex = "0.4"
+
+[[example]]
+name = "slip10_probe"
+path = "examples/slip10_probe.rs"
