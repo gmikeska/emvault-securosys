@@ -61,4 +61,9 @@ name = "taproot_probe"
 path = "examples/taproot_probe.rs"
 required-features = ["tsb"]
 
+[[example]]
+name = "mixed_taproot_spend_regtest"
+path = "examples/mixed_taproot_spend_regtest.rs"
+required-features = ["tsb"]
+
 
