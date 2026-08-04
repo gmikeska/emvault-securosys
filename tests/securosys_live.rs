@@ -54,7 +54,6 @@ fn open(lib: &str, slot: &str, pin: &str, path: &DerivationPath) -> Pkcs11Sessio
         SlotIdentifier::label(slot),
         pin.to_string(),
         path.clone(),
-        backend(lib),
     );
     Pkcs11Session::open(&cfg, &SlotIdentifier::label(slot), pin).expect("open Securosys session")
 }

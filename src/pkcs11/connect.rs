@@ -57,14 +57,13 @@ pub fn pkcs11_config(cfg: SecurosysConfig) -> Result<Pkcs11Config, SecurosysErro
         cfg.port,
     );
 
-    // The backend dlopens the same provider lib to reach the vendor
-    // `C_DeriveKeyPair` extension, so it needs its own copy of the path.
-    let backend = SecurosysBackend::new(cfg.library_path.clone());
+    // The HSM backend is no longer part of `Pkcs11Config`; construct it
+    // separately with [`SecurosysBackend::new(cfg.library_path)`] (or via
+    // [`securosys_registrar`]) and hand it to the signer's constructor.
     Ok(Pkcs11Config::new(
         cfg.library_path,
         cfg.slot,
         cfg.pin,
         cfg.derivation_path,
-        Box::new(backend),
     ))
 }

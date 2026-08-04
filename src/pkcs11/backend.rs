@@ -37,7 +37,6 @@ use std::path::PathBuf;
 use std::ptr::addr_of_mut;
 use std::sync::{Mutex, OnceLock};
 
-use cryptoki::mechanism::MechanismType;
 use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
 use cryptoki::session::Session;
 use cryptoki_sys::{
@@ -105,13 +104,30 @@ struct Ffi {
     derive_key_pair: CDeriveKeyPairFn,
 }
 
+/// Upper bound on the `priv→pub` handle map. Every `derive_path` (including the
+/// per-signature leaf derivation at sign time) records a pair, but only the
+/// master/account handle is ever looked up by `read_xpub` — and always right
+/// after it is derived. So a bounded FIFO can never evict a still-needed entry
+/// (those are the most recent), while keeping a long-running signer's map from
+/// growing without limit.
+const PUB_MAP_CAP: usize = 4096;
+
+/// A bounded `priv→pub` handle map with FIFO eviction.
+#[derive(Default)]
+struct PubMap {
+    order: std::collections::VecDeque<CK_OBJECT_HANDLE>,
+    map: HashMap<CK_OBJECT_HANDLE, CK_OBJECT_HANDLE>,
+}
+
 /// `HsmBackend` for Securosys Primus / `CloudHSM`.
 pub struct SecurosysBackend {
     lib_path: PathBuf,
     ffi: OnceLock<Ffi>,
     /// derived/generated private-key handle → its paired public-key handle,
     /// so `read_xpub` can read the EC point (which lives on the public key).
-    pub_of: Mutex<HashMap<CK_OBJECT_HANDLE, CK_OBJECT_HANDLE>>,
+    /// Bounded (see [`PUB_MAP_CAP`]) so per-signature leaf derivations don't
+    /// leak.
+    pub_of: Mutex<PubMap>,
 }
 
 impl std::fmt::Debug for SecurosysBackend {
@@ -130,7 +146,7 @@ impl SecurosysBackend {
         Self {
             lib_path: lib_path.into(),
             ffi: OnceLock::new(),
-            pub_of: Mutex::new(HashMap::new()),
+            pub_of: Mutex::new(PubMap::default()),
         }
     }
 
@@ -162,13 +178,33 @@ impl SecurosysBackend {
     }
 
     fn record_pair(&self, priv_h: CK_OBJECT_HANDLE, pub_h: CK_OBJECT_HANDLE) {
-        if let Ok(mut m) = self.pub_of.lock() {
-            m.insert(priv_h, pub_h);
+        if let Ok(mut m) = self.pub_of.lock()
+            && m.map.insert(priv_h, pub_h).is_none()
+        {
+            m.order.push_back(priv_h);
+            while m.order.len() > PUB_MAP_CAP {
+                if let Some(old) = m.order.pop_front() {
+                    m.map.remove(&old);
+                }
+            }
         }
     }
 
     /// Read the EC point (from the paired public key) + chain code (from the
-    /// private key) and assemble a normalized account xpub.
+    /// private key) and assemble a **normalized** account xpub (depth=0,
+    /// parent-fp=0, child=0).
+    ///
+    /// Normalization is forced by whole-path derivation: `C_DeriveKeyPair`
+    /// never materializes the intermediate parent, so the true BIP-32
+    /// parent-fingerprint isn't available without an extra HSM round-trip. It is
+    /// safe because those positional fields are **write-only** across emvault —
+    /// descriptor keys carry an explicit origin `(master_fingerprint, path)` and
+    /// derive from `public_key` + `chain_code` only; `sortedmulti` orders by
+    /// derived pubkey (BIP-67); addresses and signatures are unaffected. The one
+    /// place the fields surface is the *ranged* descriptor **string**, which
+    /// therefore encodes `0`s for a Securosys key. That is purely cosmetic and
+    /// self-consistent (this backend always normalizes), so re-deriving a stored
+    /// descriptor yields the identical string — no false "drift".
     fn build_xpub(
         session: &Session,
         priv_h: ObjectHandle,
@@ -200,7 +236,7 @@ impl SecurosysBackend {
         priv_h: ObjectHandle,
     ) -> Result<ObjectHandle, HsmBackendError> {
         if let Ok(m) = self.pub_of.lock()
-            && let Some(&p) = m.get(&priv_h.handle())
+            && let Some(&p) = m.map.get(&priv_h.handle())
         {
             return Ok(unsafe { ObjectHandle::new_from_raw(p) });
         }
@@ -218,27 +254,11 @@ impl SecurosysBackend {
     }
 }
 
+// Securosys derives a whole path in one vendor `C_DeriveKeyPair` and doesn't
+// expose the BIP-32 positional metadata as attributes, so it implements the
+// signer-facing `HsmBackend` **directly** rather than `AttributeDerivation` —
+// no dead accessor placeholders.
 impl HsmBackend for SecurosysBackend {
-    // Required accessors: real Securosys IDs (the derive methods are overridden
-    // below, so the default derive path never consults these — kept for the trait).
-    fn master_derive_mechanism(&self) -> MechanismType {
-        MechanismType::new_vendor_defined(CKM_EC_SLIP10_KEY_PAIR_GEN).expect("vendor-defined range")
-    }
-    fn child_derive_mechanism(&self) -> MechanismType {
-        MechanismType::new_vendor_defined(CKM_SLIP10_CHILD_DERIVE).expect("vendor-defined range")
-    }
-    fn chain_code_attribute(&self) -> AttributeType {
-        AttributeType::VendorDefined(CKA_SLIP10_CHAIN_CODE)
-    }
-    fn depth_attribute(&self) -> AttributeType {
-        AttributeType::VendorDefined(0x8000_5F02)
-    }
-    fn parent_fingerprint_attribute(&self) -> AttributeType {
-        AttributeType::VendorDefined(0x8000_5F03)
-    }
-    fn child_index_attribute(&self) -> AttributeType {
-        AttributeType::VendorDefined(0x8000_5F04)
-    }
     fn backend_name(&self) -> &'static str {
         "securosys"
     }
