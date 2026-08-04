@@ -50,7 +50,7 @@ use emvault_pkcs11::bitcoin::NetworkKind;
 use emvault_pkcs11::bitcoin::bip32::{ChainCode, ChildNumber, DerivationPath, Fingerprint, Xpub};
 use emvault_pkcs11::bitcoin::hashes::{Hash, hash160};
 use emvault_pkcs11::bitcoin::secp256k1::PublicKey;
-use emvault_pkcs11::{HsmBackend, HsmBackendError, MasterKeyHandle};
+use emvault_pkcs11::{ECDSA_SIGNER, HsmBackend, HsmBackendError, MasterKeyHandle, SegwitSigner};
 
 // --- Real Securosys constants (from /usr/local/primus/include/pkcs11.h) ---
 /// `CKM_EC_SLIP10_KEY_PAIR_GEN` — master keypair generation (seed as mech param).
@@ -444,6 +444,15 @@ impl HsmBackend for SecurosysBackend {
         let xpub = self.read_xpub(session, key_handle)?;
         Ok(fingerprint_of(&xpub.public_key))
     }
+
+    fn segwit_signer(&self) -> Option<&dyn SegwitSigner> {
+        // SegWit v0 on Securosys is stock PKCS#11 `CKM_ECDSA` (proven in
+        // `securosys_live`) — identical to every other token backend.
+        Some(&ECDSA_SIGNER)
+    }
+
+    // taproot_signer: default `None` for now — Taproot (BIP-340 over TSB REST)
+    // lands in Phase 2.
 }
 
 // --- helpers ---
