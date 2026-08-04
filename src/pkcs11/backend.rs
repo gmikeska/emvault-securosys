@@ -50,7 +50,9 @@ use emvault_pkcs11::bitcoin::NetworkKind;
 use emvault_pkcs11::bitcoin::bip32::{ChainCode, ChildNumber, DerivationPath, Fingerprint, Xpub};
 use emvault_pkcs11::bitcoin::hashes::{Hash, hash160};
 use emvault_pkcs11::bitcoin::secp256k1::PublicKey;
-use emvault_pkcs11::{ECDSA_SIGNER, HsmBackend, HsmBackendError, MasterKeyHandle, SegwitSigner};
+use emvault_pkcs11::{
+    ECDSA_SIGNER, HsmBackend, HsmBackendError, MasterKeyHandle, SegwitSigner, TaprootSigner,
+};
 
 // --- Real Securosys constants (from /usr/local/primus/include/pkcs11.h) ---
 /// `CKM_EC_SLIP10_KEY_PAIR_GEN` — master keypair generation (seed as mech param).
@@ -128,6 +130,14 @@ pub struct SecurosysBackend {
     /// Bounded (see [`PUB_MAP_CAP`]) so per-signature leaf derivations don't
     /// leak.
     pub_of: Mutex<PubMap>,
+    /// Taproot (BIP-340 Schnorr over TSB REST) signer, present only when the
+    /// `tsb` feature is on **and** TSB is configured in the environment
+    /// (`SECUROSYS_TSB_URL` + `SECUROSYS_TSB_JWT`). Drives
+    /// [`HsmBackend::taproot_signer`], which in turn sets the signer's Taproot
+    /// capability. Schnorr is REST-only on Securosys, so this transport is
+    /// independent of the PKCS#11 session used for ECDSA/derivation.
+    #[cfg(feature = "tsb")]
+    taproot: Option<crate::tsb::SecurosysTaprootSigner>,
 }
 
 impl std::fmt::Debug for SecurosysBackend {
@@ -141,12 +151,25 @@ impl std::fmt::Debug for SecurosysBackend {
 impl SecurosysBackend {
     /// Create a backend that loads the vendor entry points from `lib_path` on
     /// first use.
+    ///
+    /// When the `tsb` feature is enabled, the Taproot (Schnorr/TSB) signer is
+    /// self-configured from the environment ([`SecurosysTaprootSigner::from_env`]):
+    /// present iff `SECUROSYS_TSB_URL` + `SECUROSYS_TSB_JWT` are set. A
+    /// half-configured environment is logged and treated as "no Taproot" rather
+    /// than a hard failure, so ECDSA-only deployments are unaffected.
+    ///
+    /// [`SecurosysTaprootSigner::from_env`]: crate::tsb::SecurosysTaprootSigner::from_env
     #[must_use]
     pub fn new(lib_path: impl Into<PathBuf>) -> Self {
         Self {
             lib_path: lib_path.into(),
             ffi: OnceLock::new(),
             pub_of: Mutex::new(PubMap::default()),
+            #[cfg(feature = "tsb")]
+            taproot: crate::tsb::SecurosysTaprootSigner::from_env().unwrap_or_else(|e| {
+                log::warn!("Securosys TSB Taproot disabled: {e}");
+                None
+            }),
         }
     }
 
@@ -240,17 +263,63 @@ impl SecurosysBackend {
         {
             return Ok(unsafe { ObjectHandle::new_from_raw(p) });
         }
-        // Fallback: persisted master reloaded by label.
+        // Fallback: persisted master reloaded by label. Two labelings exist:
+        // - PKCS#11-native master → public key under the `.pub` sibling label;
+        // - TSB-imported master → public key under the SAME label as the private
+        //   key (class disambiguates). Try same-label first, then the sibling.
         let label = read_label(session, priv_h)?;
-        let pub_label = pub_sibling_label(&label);
-        let found = session.find_objects(&[
-            Attribute::Class(ObjectClass::PUBLIC_KEY),
-            Attribute::Label(pub_label.into_bytes()),
-        ])?;
-        found
-            .into_iter()
-            .next()
-            .ok_or_else(|| HsmBackendError::MetadataError("no paired public key found".into()))
+        for candidate in [label.clone(), pub_sibling_label(&label)] {
+            if let Some(h) = find_one(session, ObjectClass::PUBLIC_KEY, &candidate)? {
+                return Ok(h);
+            }
+        }
+        Err(HsmBackendError::MetadataError(
+            "no paired public key found".into(),
+        ))
+    }
+
+    /// Create the master via TSB `importedKey` (TSB-configured path). The key is
+    /// registered as a TSB-derivable SLIP-10 master **and** materialized as a
+    /// PKCS#11 keypair on the token (private + public both under `label`), so the
+    /// ECDSA/derivation path is unaffected. Idempotent: a re-import of the same
+    /// deterministic seed is harmless — if TSB rejects a duplicate but the key is
+    /// already on the token, we proceed with the on-token key.
+    #[cfg(feature = "tsb")]
+    fn import_master_via_tsb(
+        &self,
+        session: &Session,
+        seed: &[u8],
+        label: &str,
+    ) -> Result<MasterKeyHandle, HsmBackendError> {
+        let taproot = self
+            .taproot
+            .as_ref()
+            .expect("import_master_via_tsb called only when taproot is Some");
+        let import_res = taproot.client().import_slip10_master(label, seed);
+
+        // Private-key handle (for ECDSA/derivation + read_xpub).
+        let priv_h =
+            find_one(session, ObjectClass::PRIVATE_KEY, label)?.ok_or_else(
+                || match &import_res {
+                    Err(e) => HsmBackendError::Derivation(format!("TSB importedKey failed: {e}")),
+                    Ok(()) => HsmBackendError::MetadataError(
+                        "TSB import ok but master private key not found on token".into(),
+                    ),
+                },
+            )?;
+        // TSB stores the paired public key under the SAME label (class differs).
+        let pub_h = find_one(session, ObjectClass::PUBLIC_KEY, label)?.ok_or_else(|| {
+            HsmBackendError::MetadataError("TSB master public key not found on token".into())
+        })?;
+
+        self.record_pair(priv_h.handle(), pub_h.handle());
+        let xpub = Self::build_xpub(session, priv_h, pub_h)?;
+        let fingerprint = fingerprint_of(&xpub.public_key);
+        Ok(MasterKeyHandle {
+            key_handle: priv_h,
+            xpub,
+            fingerprint,
+        })
     }
 }
 
@@ -263,7 +332,18 @@ impl HsmBackend for SecurosysBackend {
         "securosys"
     }
 
-    /// SLIP-10 master keygen from `seed` (128–512 bits), persisted as a token.
+    /// SLIP-10 master from `seed` (128–512 bits), persisted as a token.
+    ///
+    /// Bifurcated on TSB configuration:
+    /// - **TSB configured** (`SECUROSYS_TSB_URL` + `SECUROSYS_TSB_JWT` present, so
+    ///   `taproot` is `Some`): create via TSB `importedKey`. That registers the
+    ///   master as TSB-derivable (enabling Taproot/BIP-340) **and** leaves it
+    ///   usable via PKCS#11 for ECDSA/derivation — one master serves both.
+    /// - **TSB not configured**: PKCS#11-native `CKM_EC_SLIP10_KEY_PAIR_GEN`
+    ///   (SegWit-only, zero TSB dependency), the path below.
+    ///
+    /// Both yield the **byte-identical** master for a given `seed`, so a vault
+    /// created one way is bit-for-bit the same as the other.
     fn derive_master_key(
         &self,
         session: &Session,
@@ -274,6 +354,10 @@ impl HsmBackend for SecurosysBackend {
             return Err(HsmBackendError::Derivation(
                 "Securosys SLIP-10 master gen needs a non-empty seed".into(),
             ));
+        }
+        #[cfg(feature = "tsb")]
+        if self.taproot.is_some() {
+            return self.import_master_via_tsb(session, seed, label);
         }
         let mut mech = CK_MECHANISM {
             mechanism: CKM_EC_SLIP10_KEY_PAIR_GEN,
@@ -288,7 +372,7 @@ impl HsmBackend for SecurosysBackend {
         let (mut t, mut f): (CK_BBOOL, CK_BBOOL) = (CK_TRUE, CK_FALSE);
         let mut priv_label = label.as_bytes().to_vec();
         // Persist the paired public key under emvault's `/pub` sibling label
-        // (the private key arrives as `emvault/v1/<name>/priv`), so a fresh
+        // (the private key arrives as `emvault.v1.<name>.priv`), so a fresh
         // process can re-find it in `read_xpub` after `load()`.
         let mut pub_label = pub_sibling_label(label).into_bytes();
 
@@ -451,19 +535,30 @@ impl HsmBackend for SecurosysBackend {
         Some(&ECDSA_SIGNER)
     }
 
-    // taproot_signer: default `None` for now — Taproot (BIP-340 over TSB REST)
-    // lands in Phase 2.
+    /// Taproot (BIP-340 Schnorr) via TSB REST — present iff the `tsb` feature is
+    /// built and TSB is configured in the environment. Without `tsb`, always
+    /// `None` (the crate's default), so ECDSA-only builds don't pull in reqwest.
+    fn taproot_signer(&self) -> Option<&dyn TaprootSigner> {
+        #[cfg(feature = "tsb")]
+        {
+            self.taproot.as_ref().map(|t| t as &dyn TaprootSigner)
+        }
+        #[cfg(not(feature = "tsb"))]
+        {
+            None
+        }
+    }
 }
 
 // --- helpers ---
 
-/// Map a private-key label (`emvault/v1/<name>/priv`) to its public sibling
-/// (`.../pub`), matching `emvault_pkcs11::key_ops::pub_label`. Falls back to
-/// appending `/pub` if the expected `/priv` suffix is absent.
+/// Map a private-key label (`emvault.v1.<name>.priv`) to its public sibling
+/// (`….pub`), matching `emvault_pkcs11::key_ops::pub_label`. Falls back to
+/// appending `.pub` if the expected `.priv` suffix is absent.
 fn pub_sibling_label(priv_label: &str) -> String {
     priv_label
-        .strip_suffix("/priv")
-        .map_or_else(|| format!("{priv_label}/pub"), |base| format!("{base}/pub"))
+        .strip_suffix(".priv")
+        .map_or_else(|| format!("{priv_label}.pub"), |base| format!("{base}.pub"))
 }
 
 fn attr(t: CK_ATTRIBUTE_TYPE, p: *mut c_void, len: usize) -> CK_ATTRIBUTE {
@@ -494,6 +589,21 @@ fn get_vendor(session: &Session, h: ObjectHandle, t: u64) -> Result<Vec<u8>, Hsm
             _ => None,
         })
         .ok_or_else(|| HsmBackendError::MetadataError(format!("missing vendor attr 0x{t:x}")))
+}
+
+/// Find at most one object of `class` with the exact `label`.
+fn find_one(
+    session: &Session,
+    class: ObjectClass,
+    label: &str,
+) -> Result<Option<ObjectHandle>, HsmBackendError> {
+    Ok(session
+        .find_objects(&[
+            Attribute::Class(class),
+            Attribute::Label(label.as_bytes().to_vec()),
+        ])?
+        .into_iter()
+        .next())
 }
 
 fn read_label(session: &Session, h: ObjectHandle) -> Result<String, HsmBackendError> {

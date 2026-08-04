@@ -14,8 +14,8 @@ path = "src/lib.rs"
 default = ["pkcs11"]
 # Native PKCS#11 (Primus P11 provider) transport — ECDSA + BIP-32/SLIP-10.
 pkcs11 = []
-# Transaction Security Broker REST transport — Schnorr/BIP-340 for Taproot (Phase 3).
-tsb = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
+# Transaction Security Broker REST transport — Schnorr/BIP-340 for Taproot.
+tsb = ["dep:reqwest", "dep:serde_json", "dep:base64"]
 taproot = ["tsb"]
 
 [dependencies]
@@ -33,10 +33,10 @@ thiserror = "2"
 dotenvy = "0.15"
 log = "0.4"
 
-# Optional — only compiled for the `tsb` feature (Phase 3, Taproot).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-tokio = { version = "1", features = ["rt", "macros"], optional = true }
+# Optional — only compiled for the `tsb` feature (Taproot).
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"], optional = true }
 serde_json = { version = "1", optional = true }
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"
@@ -55,3 +55,10 @@ dotenvy = "0.15"
 [[example]]
 name = "slip10_probe"
 path = "examples/slip10_probe.rs"
+
+[[example]]
+name = "taproot_probe"
+path = "examples/taproot_probe.rs"
+required-features = ["tsb"]
+
+

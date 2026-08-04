@@ -50,3 +50,6 @@ pub use error::SecurosysError;
 
 #[cfg(feature = "pkcs11")]
 pub use pkcs11::{SecurosysBackend, pkcs11_config};
+
+#[cfg(feature = "tsb")]
+pub use tsb::{JwtProvider, SecurosysTaprootSigner, StaticJwt, TsbClient, TsbError};
